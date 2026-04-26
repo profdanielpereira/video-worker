@@ -6,8 +6,6 @@ import subprocess
 import json
 import shutil
 import os
-import statistics
-import cv2
 
 app = FastAPI()
 
@@ -22,23 +20,42 @@ class VideoInfoRequest(BaseModel):
 
 class AnalyzeCropRequest(BaseModel):
     input_path: str
-    start: Optional[Union[str, float, int]] = None
-    end: Optional[Union[str, float, int]] = None
     output_width: int = 720
     output_height: int = 1280
-    samples: int = 12
+    crop_x: Optional[int] = None
+    crop_y: Optional[int] = None
+    center_x: Optional[float] = None
 
 
-class ProcessAutoCropRequest(BaseModel):
+class ProcessFixedCropRequest(BaseModel):
     input_path: str
     output_path: str
     start: Optional[Union[str, float, int]] = None
     end: Optional[Union[str, float, int]] = None
     output_width: int = 720
     output_height: int = 1280
-    samples: int = 12
+    crop_x: Optional[int] = None
+    crop_y: Optional[int] = None
+    center_x: Optional[float] = None
     subtitle_path: Optional[str] = None
     crf: int = Field(default=20, ge=16, le=30)
+
+
+class ExtractFrameRequest(BaseModel):
+    input_path: str
+    output_path: str
+    timestamp: Optional[Union[str, float, int]] = 5
+
+
+class PreviewCropRequest(BaseModel):
+    input_path: str
+    output_path: str
+    timestamp: Optional[Union[str, float, int]] = 5
+    output_width: int = 720
+    output_height: int = 1280
+    crop_x: Optional[int] = None
+    crop_y: Optional[int] = None
+    center_x: Optional[float] = None
 
 
 class ExtractAudioRequest(BaseModel):
@@ -163,7 +180,15 @@ def get_video_info(input_path: str):
     }
 
 
-def calculate_crop(input_width, input_height, output_width, output_height, center_x=None):
+def calculate_crop(
+    input_width,
+    input_height,
+    output_width,
+    output_height,
+    crop_x=None,
+    crop_y=None,
+    center_x=None
+):
     target_ratio = output_width / output_height
 
     crop_h = input_height
@@ -176,10 +201,17 @@ def calculate_crop(input_width, input_height, output_width, output_height, cente
     if center_x is None:
         center_x = input_width / 2
 
-    crop_x = make_even(center_x - crop_w / 2)
-    crop_y = 0
+    if crop_x is None:
+        crop_x = center_x - crop_w / 2
 
+    crop_x = make_even(crop_x)
     crop_x = clamp(crop_x, 0, input_width - crop_w)
+
+    if crop_y is None:
+        crop_y = 0
+
+    crop_y = make_even(crop_y)
+    crop_y = clamp(crop_y, 0, input_height - crop_h)
 
     return {
         "crop_w": int(crop_w),
@@ -189,86 +221,23 @@ def calculate_crop(input_width, input_height, output_width, output_height, cente
     }
 
 
-def analyze_crop_internal(input_path: str, start=None, end=None, output_width=720, output_height=1280, samples=12):
+def analyze_crop_internal(
+    input_path: str,
+    output_width=720,
+    output_height=1280,
+    crop_x=None,
+    crop_y=None,
+    center_x=None
+):
     info = get_video_info(input_path)
 
-    input_width = info["width"]
-    input_height = info["height"]
-    duration = info["duration"]
-
-    start_sec = parse_time(start) if start is not None else 0
-    end_sec = parse_time(end) if end is not None else duration
-
-    if duration is None:
-        raise HTTPException(status_code=400, detail="Não foi possível obter a duração do vídeo.")
-
-    if end_sec is None or end_sec > duration:
-        end_sec = duration
-
-    if start_sec >= end_sec:
-        raise HTTPException(status_code=400, detail="O tempo inicial precisa ser menor que o tempo final.")
-
-    cap = cv2.VideoCapture(input_path)
-
-    if not cap.isOpened():
-        raise HTTPException(status_code=500, detail="Não foi possível abrir o vídeo com OpenCV.")
-
-    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(cascade_path)
-
-    if face_cascade.empty():
-        raise HTTPException(status_code=500, detail="Não foi possível carregar o detector de rosto.")
-
-    face_centers = []
-
-    samples = max(3, min(samples, 30))
-
-    if samples == 1:
-        times = [(start_sec + end_sec) / 2]
-    else:
-        interval = (end_sec - start_sec) / (samples - 1)
-        times = [start_sec + i * interval for i in range(samples)]
-
-    for t in times:
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        success, frame = cap.read()
-
-        if not success or frame is None:
-            continue
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(40, 40)
-        )
-
-        if len(faces) == 0:
-            continue
-
-        # Pega o maior rosto detectado
-        largest_face = max(faces, key=lambda f: f[2] * f[3])
-        x, y, w, h = largest_face
-
-        center_x = x + w / 2
-        face_centers.append(center_x)
-
-    cap.release()
-
-    if face_centers:
-        center_x = statistics.median(face_centers)
-        detection_found = True
-    else:
-        center_x = input_width / 2
-        detection_found = False
-
     crop = calculate_crop(
-        input_width=input_width,
-        input_height=input_height,
+        input_width=info["width"],
+        input_height=info["height"],
         output_width=output_width,
         output_height=output_height,
+        crop_x=crop_x,
+        crop_y=crop_y,
         center_x=center_x
     )
 
@@ -278,19 +247,52 @@ def analyze_crop_internal(input_path: str, start=None, end=None, output_width=72
             "width": output_width,
             "height": output_height
         },
-        "face_detection": {
-            "found": detection_found,
-            "samples_used": samples,
-            "faces_detected_in_frames": len(face_centers),
-            "center_x": center_x
-        },
+        "crop_mode": "fixed",
+        "message": "Crop fixo/manual. Sem OpenCV, sem cv2 e sem NumPy.",
         "crop": crop
     }
 
 
 def escape_ass_path(path: str):
-    # Para caminhos Linux simples, isso já resolve a maioria dos casos.
     return str(Path(path).resolve()).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def build_video_filter(crop, output_width, output_height, subtitle_path=None):
+    video_filter = (
+        f"crop={crop['crop_w']}:{crop['crop_h']}:{crop['crop_x']}:{crop['crop_y']},"
+        f"scale={output_width}:{output_height},"
+        f"setsar=1"
+    )
+
+    if subtitle_path:
+        ensure_file_exists(subtitle_path)
+        subtitle_path = escape_ass_path(subtitle_path)
+        video_filter += f",ass='{subtitle_path}'"
+
+    return video_filter
+
+
+def add_time_args(command, start=None, end=None):
+    start_sec = parse_time(start) if start is not None else None
+    end_sec = parse_time(end) if end is not None else None
+
+    if start_sec is not None:
+        command += ["-ss", str(start_sec)]
+
+    return command, start_sec, end_sec
+
+
+def add_duration_args(command, start_sec=None, end_sec=None):
+    if end_sec is not None:
+        if start_sec is not None:
+            duration = end_sec - start_sec
+            if duration <= 0:
+                raise HTTPException(status_code=400, detail="O tempo final precisa ser maior que o inicial.")
+            command += ["-t", str(duration)]
+        else:
+            command += ["-to", str(end_sec)]
+
+    return command
 
 
 # =========================
@@ -330,59 +332,126 @@ def video_info(request: VideoInfoRequest):
 def analyze_crop(request: AnalyzeCropRequest):
     return analyze_crop_internal(
         input_path=request.input_path,
-        start=request.start,
-        end=request.end,
         output_width=request.output_width,
         output_height=request.output_height,
-        samples=request.samples
+        crop_x=request.crop_x,
+        crop_y=request.crop_y,
+        center_x=request.center_x
     )
 
 
-@app.post("/process-auto-crop")
-def process_auto_crop(request: ProcessAutoCropRequest):
+@app.post("/extract-frame")
+def extract_frame(request: ExtractFrameRequest):
+    ensure_file_exists(request.input_path)
+    ensure_parent_folder(request.output_path)
+
+    timestamp = parse_time(request.timestamp)
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss", str(timestamp),
+        "-i", request.input_path,
+        "-frames:v", "1",
+        "-q:v", "2",
+        request.output_path
+    ]
+
+    run_command(command, timeout=300)
+
+    return {
+        "status": "success",
+        "message": "Frame extraído.",
+        "input_path": request.input_path,
+        "output_path": request.output_path,
+        "timestamp": timestamp
+    }
+
+
+@app.post("/preview-crop")
+def preview_crop(request: PreviewCropRequest):
     ensure_file_exists(request.input_path)
     ensure_parent_folder(request.output_path)
 
     analysis = analyze_crop_internal(
         input_path=request.input_path,
-        start=request.start,
-        end=request.end,
         output_width=request.output_width,
         output_height=request.output_height,
-        samples=request.samples
+        crop_x=request.crop_x,
+        crop_y=request.crop_y,
+        center_x=request.center_x
+    )
+
+    crop = analysis["crop"]
+    video_filter = build_video_filter(
+        crop=crop,
+        output_width=request.output_width,
+        output_height=request.output_height
+    )
+
+    timestamp = parse_time(request.timestamp)
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-ss", str(timestamp),
+        "-i", request.input_path,
+        "-frames:v", "1",
+        "-vf", video_filter,
+        "-q:v", "2",
+        request.output_path
+    ]
+
+    run_command(command, timeout=300)
+
+    return {
+        "status": "success",
+        "message": "Preview do crop gerado.",
+        "input_path": request.input_path,
+        "output_path": request.output_path,
+        "timestamp": timestamp,
+        "analysis": analysis
+    }
+
+
+@app.post("/process-fixed-crop")
+def process_fixed_crop(request: ProcessFixedCropRequest):
+    ensure_file_exists(request.input_path)
+    ensure_parent_folder(request.output_path)
+
+    analysis = analyze_crop_internal(
+        input_path=request.input_path,
+        output_width=request.output_width,
+        output_height=request.output_height,
+        crop_x=request.crop_x,
+        crop_y=request.crop_y,
+        center_x=request.center_x
     )
 
     crop = analysis["crop"]
 
-    video_filter = (
-        f"crop={crop['crop_w']}:{crop['crop_h']}:{crop['crop_x']}:{crop['crop_y']},"
-        f"scale={request.output_width}:{request.output_height},"
-        f"setsar=1"
+    video_filter = build_video_filter(
+        crop=crop,
+        output_width=request.output_width,
+        output_height=request.output_height,
+        subtitle_path=request.subtitle_path
     )
-
-    if request.subtitle_path:
-        ensure_file_exists(request.subtitle_path)
-        subtitle_path = escape_ass_path(request.subtitle_path)
-        video_filter += f",ass='{subtitle_path}'"
 
     command = ["ffmpeg", "-y"]
 
-    start_sec = parse_time(request.start) if request.start is not None else None
-    end_sec = parse_time(request.end) if request.end is not None else None
-
-    if start_sec is not None:
-        command += ["-ss", str(start_sec)]
+    command, start_sec, end_sec = add_time_args(
+        command,
+        start=request.start,
+        end=request.end
+    )
 
     command += ["-i", request.input_path]
 
-    if end_sec is not None:
-        if start_sec is not None:
-            duration = end_sec - start_sec
-            if duration <= 0:
-                raise HTTPException(status_code=400, detail="O tempo final precisa ser maior que o inicial.")
-            command += ["-t", str(duration)]
-        else:
-            command += ["-to", str(end_sec)]
+    command = add_duration_args(
+        command,
+        start_sec=start_sec,
+        end_sec=end_sec
+    )
 
     command += [
         "-vf", video_filter,
@@ -399,11 +468,21 @@ def process_auto_crop(request: ProcessAutoCropRequest):
 
     return {
         "status": "success",
-        "message": "Vídeo processado com crop automático.",
+        "message": "Vídeo processado com crop fixo.",
         "input_path": request.input_path,
         "output_path": request.output_path,
         "analysis": analysis
     }
+
+
+@app.post("/process-auto-crop")
+def process_auto_crop(request: ProcessFixedCropRequest):
+    """
+    Mantive esta rota para não quebrar o fluxo caso a gente já tenha usado o nome /process-auto-crop.
+    Mas agora ela NÃO faz detecção automática por rosto.
+    Ela usa crop fixo/manual com crop_x, crop_y ou center_x.
+    """
+    return process_fixed_crop(request)
 
 
 @app.post("/extract-audio")
@@ -413,22 +492,19 @@ def extract_audio(request: ExtractAudioRequest):
 
     command = ["ffmpeg", "-y"]
 
-    start_sec = parse_time(request.start) if request.start is not None else None
-    end_sec = parse_time(request.end) if request.end is not None else None
-
-    if start_sec is not None:
-        command += ["-ss", str(start_sec)]
+    command, start_sec, end_sec = add_time_args(
+        command,
+        start=request.start,
+        end=request.end
+    )
 
     command += ["-i", request.input_path]
 
-    if end_sec is not None:
-        if start_sec is not None:
-            duration = end_sec - start_sec
-            if duration <= 0:
-                raise HTTPException(status_code=400, detail="O tempo final precisa ser maior que o inicial.")
-            command += ["-t", str(duration)]
-        else:
-            command += ["-to", str(end_sec)]
+    command = add_duration_args(
+        command,
+        start_sec=start_sec,
+        end_sec=end_sec
+    )
 
     command += [
         "-vn",
