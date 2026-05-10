@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse
 from pathlib import Path
 from typing import Optional
@@ -7,9 +7,20 @@ import json
 import shutil
 import uuid
 import re
+import os
+import time
 
 
 app = FastAPI()
+
+
+# =========================
+# Configurações
+# =========================
+
+PUBLIC_ROOT = Path(os.getenv("PUBLIC_UPLOAD_DIR", "/tmp/video-public"))
+PUBLIC_TTL_DEFAULT = int(os.getenv("PUBLIC_UPLOAD_TTL_SECONDS", "21600"))  # 6 horas
+PUBLIC_TTL_MAX = int(os.getenv("PUBLIC_UPLOAD_TTL_MAX_SECONDS", "86400"))  # 24 horas
 
 
 # =========================
@@ -208,6 +219,61 @@ def build_cover_video_filter(output_width, output_height, fps):
     )
 
 
+def get_public_base_url(request: Request):
+    env_base_url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if env_base_url:
+        return env_base_url
+
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+
+    if proto and "," in proto:
+        proto = proto.split(",")[0].strip()
+
+    if host and "," in host:
+        host = host.split(",")[0].strip()
+
+    if not host:
+        return str(request.base_url).rstrip("/")
+
+    return f"{proto}://{host}".rstrip("/")
+
+
+def validate_token(token: str):
+    if not re.fullmatch(r"[a-zA-Z0-9_-]+", token or ""):
+        raise HTTPException(status_code=400, detail="Token inválido.")
+
+
+def cleanup_public_files():
+    PUBLIC_ROOT.mkdir(parents=True, exist_ok=True)
+
+    now = time.time()
+    deleted = 0
+
+    for item in PUBLIC_ROOT.iterdir():
+        if not item.is_dir():
+            continue
+
+        meta_path = item / "meta.json"
+        expires_at = None
+
+        try:
+            if meta_path.exists():
+                with meta_path.open("r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                expires_at = float(meta.get("expires_at", 0))
+            else:
+                expires_at = item.stat().st_mtime + PUBLIC_TTL_DEFAULT
+        except Exception:
+            expires_at = item.stat().st_mtime + PUBLIC_TTL_DEFAULT
+
+        if expires_at and expires_at < now:
+            shutil.rmtree(str(item), ignore_errors=True)
+            deleted += 1
+
+    return deleted
+
+
 # =========================
 # Routes
 # =========================
@@ -233,6 +299,117 @@ def ffmpeg_version():
     return {
         "status": "ok" if result.returncode == 0 else "error",
         "ffmpeg": first_line
+    }
+
+
+@app.post("/public-upload")
+async def public_upload(
+    request: Request,
+    video: UploadFile = File(...),
+    ttl_seconds: int = Form(PUBLIC_TTL_DEFAULT),
+    filename: Optional[str] = Form(None)
+):
+    cleanup_public_files()
+
+    ttl_seconds = int(clamp(ttl_seconds, 60, PUBLIC_TTL_MAX))
+
+    token = uuid.uuid4().hex
+    upload_dir = PUBLIC_ROOT / token
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    video_name = safe_filename(filename or video.filename, "video.mp4")
+    video_path = upload_dir / video_name
+
+    await save_upload(video, video_path)
+
+    created_at = time.time()
+    expires_at = created_at + ttl_seconds
+
+    meta = {
+        "token": token,
+        "filename": video_name,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "ttl_seconds": ttl_seconds
+    }
+
+    with (upload_dir / "meta.json").open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    base_url = get_public_base_url(request)
+
+    return {
+        "status": "ok",
+        "token": token,
+        "filename": video_name,
+        "video_url": f"{base_url}/public/{token}/{video_name}",
+        "delete_url": f"{base_url}/public/{token}",
+        "expires_at": expires_at,
+        "ttl_seconds": ttl_seconds
+    }
+
+
+@app.get("/public/{token}/{filename}")
+def get_public_file(token: str, filename: str):
+    validate_token(token)
+
+    cleanup_public_files()
+
+    filename = safe_filename(filename, "video.mp4")
+    file_path = PUBLIC_ROOT / token / filename
+    meta_path = PUBLIC_ROOT / token / "meta.json"
+
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Arquivo não encontrado ou expirado.")
+
+    if meta_path.exists():
+        try:
+            with meta_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            if time.time() > float(meta.get("expires_at", 0)):
+                shutil.rmtree(str(PUBLIC_ROOT / token), ignore_errors=True)
+                raise HTTPException(status_code=404, detail="Arquivo expirado.")
+
+            if meta.get("filename") and meta["filename"] != filename:
+                raise HTTPException(status_code=404, detail="Arquivo não encontrado.")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
+    return FileResponse(
+        path=str(file_path),
+        media_type="video/mp4",
+        filename=filename,
+        headers={
+            "Cache-Control": "no-store"
+        }
+    )
+
+
+@app.delete("/public/{token}")
+def delete_public_file(token: str):
+    validate_token(token)
+
+    target_dir = PUBLIC_ROOT / token
+
+    if target_dir.exists():
+        shutil.rmtree(str(target_dir), ignore_errors=True)
+
+    return {
+        "status": "ok",
+        "deleted": True
+    }
+
+
+@app.post("/cleanup-public-files")
+def cleanup_public_files_route():
+    deleted = cleanup_public_files()
+
+    return {
+        "status": "ok",
+        "deleted": deleted
     }
 
 
